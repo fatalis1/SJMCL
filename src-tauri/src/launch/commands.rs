@@ -33,7 +33,7 @@ use crate::launch::helpers::graphics_handler::{
 use crate::launch::helpers::jre_selector::select_java_runtime;
 use crate::launch::helpers::log_parser::parse_crash_report_path_from_log;
 use crate::launch::helpers::lwjgl3ify::{
-  prepare_lwjgl3ify, resolve_lwjgl3ify, validate_lwjgl3ify_java,
+  apply_lwjgl3ify_profile, prepare_lwjgl3ify, resolve_lwjgl3ify, select_lwjgl3ify_java,
 };
 use crate::launch::helpers::misc::get_separator;
 use crate::launch::helpers::process_monitor::{
@@ -71,30 +71,31 @@ pub async fn select_suitable_jre(
     .version_path
     .join(format!("{}.json", instance.name));
   let mut client_info = load_json_async::<McClientInfo>(&client_path).await?;
-  let lwjgl3ify = resolve_lwjgl3ify(&app, &instance, &game_config, &mut client_info).await?;
+  let lwjgl3ify = resolve_lwjgl3ify(&app, &instance, &game_config).await?;
 
   refresh_and_update_javas(&app).await;
 
-  let selected_java = select_java_runtime(
-    &app,
-    Some(&game_config.game_java),
-    &instance,
-    client_info
+  let (selected_java, lwjgl3ify) = if let Some((info, profile)) = lwjgl3ify {
+    let minimum = client_info
       .java_version
       .as_ref()
-      .map_or(0i32, |v| v.major_version),
-  )
-  .await?;
-
-  if lwjgl3ify.is_some() {
-    validate_lwjgl3ify_java(
-      selected_java.major_version,
+      .map_or(17, |java| java.major_version.max(17));
+    let (java, platform) = select_lwjgl3ify_java(&app, &game_config.game_java, minimum).await?;
+    apply_lwjgl3ify_profile(&mut client_info, profile, &platform)?;
+    (java, Some(info))
+  } else {
+    let java = select_java_runtime(
+      &app,
+      Some(&game_config.game_java),
+      &instance,
       client_info
         .java_version
         .as_ref()
-        .map_or(17, |java| java.major_version),
-    )?;
-  }
+        .map_or(0i32, |v| v.major_version),
+    )
+    .await?;
+    (java, None)
+  };
 
   let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let mut launching = launching_queue_state.lock()?;

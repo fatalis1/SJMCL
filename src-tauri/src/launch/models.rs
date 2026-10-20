@@ -21,13 +21,8 @@ pub enum LaunchError {
   LaunchingStateNotFound,
   AuthlibInjectorNotReady,
   AuthServerNotFound,
-  Lwjgl3ifyInvalidMetadata,
-  Lwjgl3ifyDuplicateMods,
-  Lwjgl3ifyJavaIncompatible,
-  Lwjgl3ifyConflictingArguments,
-  Lwjgl3ifyPreparationFailed,
-  Lwjgl3ifyModChanged,
-  Lwjgl3ifyUnsupportedPlatform,
+  DuplicateLwjgl3ify,
+  UnsupportedPlatform,
 }
 
 impl std::error::Error for LaunchError {}
