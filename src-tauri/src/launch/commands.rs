@@ -32,6 +32,7 @@ use crate::launch::helpers::graphics_handler::{
 };
 use crate::launch::helpers::jre_selector::select_java_runtime;
 use crate::launch::helpers::log_parser::parse_crash_report_path_from_log;
+use crate::launch::helpers::lwjgl3ify;
 use crate::launch::helpers::misc::get_separator;
 use crate::launch::helpers::process_monitor::{
   kill_process, monitor_process, set_process_priority,
@@ -71,16 +72,37 @@ pub async fn select_suitable_jre(
 
   refresh_and_update_javas(&app).await;
 
-  let selected_java = select_java_runtime(
-    &app,
-    Some(&game_config.game_java),
-    &instance,
-    client_info
-      .java_version
-      .as_ref()
-      .map_or(0i32, |v| v.major_version),
-  )
-  .await?;
+  // lwjgl3ify relaunches the game by itself (see helpers/lwjgl3ify.rs), so the
+  // launcher only has to start the first JVM with a version it supports.
+  let lwjgl3ify_detected = lwjgl3ify::is_supported_instance(&instance)
+    && get_instance_subdir_paths(&app, &instance, &[&InstanceSubdirType::Mods])
+      .and_then(|dirs| dirs.into_iter().next())
+      .is_some_and(|mods_dir| lwjgl3ify::is_enabled(&mods_dir));
+
+  let client_json_req = client_info
+    .java_version
+    .as_ref()
+    .map_or(0i32, |v| v.major_version);
+  let java_req = if lwjgl3ify_detected {
+    log::info!(
+      "lwjgl3ify detected, requiring Java {} or newer for the relaunched game",
+      lwjgl3ify::MIN_JAVA_VERSION
+    );
+    client_json_req.max(lwjgl3ify::MIN_JAVA_VERSION)
+  } else {
+    client_json_req
+  };
+
+  let selected_java =
+    select_java_runtime(&app, Some(&game_config.game_java), &instance, java_req).await?;
+
+  if lwjgl3ify_detected && selected_java.major_version < lwjgl3ify::MIN_JAVA_VERSION {
+    log::warn!(
+      "lwjgl3ify needs Java {} or newer, but Java {} was selected explicitly; the game may fail to start",
+      lwjgl3ify::MIN_JAVA_VERSION,
+      selected_java.major_version
+    );
+  }
 
   let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let mut launching = launching_queue_state.lock()?;
