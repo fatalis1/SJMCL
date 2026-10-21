@@ -35,6 +35,8 @@ pub struct LaunchingState {
   pub selected_instance: Instance,
   pub game_config: GameConfig,
   pub client_info: McClientInfo,
+  #[serde(skip)]
+  pub profile_managed_jvm: bool,
   pub selected_player: Option<PlayerInfo>, // use Option to avoid SmartDefault trait error
   pub auth_server_meta: Option<String>,
   pub full_command: String, // for export and debug

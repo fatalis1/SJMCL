@@ -251,6 +251,7 @@ pub struct DownloadsValue {
 #[serde(rename_all = "camelCase", default)]
 pub struct LibrariesValue {
   pub name: String,
+  pub url: Option<String>,
   pub downloads: Option<LibrariesDownloads>,
   pub natives: Option<HashMap<String, String>>,
   pub extract: Option<LibrariesExtract>,

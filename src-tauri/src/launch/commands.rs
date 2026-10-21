@@ -32,6 +32,7 @@ use crate::launch::helpers::graphics_handler::{
 };
 use crate::launch::helpers::jre_selector::select_java_runtime;
 use crate::launch::helpers::log_parser::parse_crash_report_path_from_log;
+use crate::launch::helpers::lwjgl3ify::try_apply_lwjgl3ify;
 use crate::launch::helpers::misc::get_separator;
 use crate::launch::helpers::process_monitor::{
   kill_process, monitor_process, set_process_priority,
@@ -70,17 +71,24 @@ pub async fn select_suitable_jre(
   let client_info = load_json_async::<McClientInfo>(&client_path).await?;
 
   refresh_and_update_javas(&app).await;
-
-  let selected_java = select_java_runtime(
-    &app,
-    Some(&game_config.game_java),
-    &instance,
-    client_info
+  let (client_info, selected_java, profile_managed_jvm) = if let Some((profile, java)) =
+    try_apply_lwjgl3ify(&app, &instance, &game_config.game_java, &client_info).await?
+  {
+    (profile, java, true)
+  } else {
+    let java_requirement = client_info
       .java_version
       .as_ref()
-      .map_or(0i32, |v| v.major_version),
-  )
-  .await?;
+      .map_or(0, |java| java.major_version);
+    let selected_java = select_java_runtime(
+      &app,
+      Some(&game_config.game_java),
+      &instance,
+      java_requirement,
+    )
+    .await?;
+    (client_info, selected_java, false)
+  };
 
   let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let mut launching = launching_queue_state.lock()?;
@@ -88,6 +96,7 @@ pub async fn select_suitable_jre(
     id: timestamp,
     game_config,
     client_info,
+    profile_managed_jvm,
     selected_java,
     selected_instance: instance,
     ..LaunchingState::default()

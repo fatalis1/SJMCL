@@ -36,18 +36,22 @@ pub async fn refresh_and_update_javas(app: &AppHandle) {
     // ensure execute permissions (for Linux and macOS)
     let _ = manage_permissions_unix(&java_exec_path, 0o111, PermissionOperation::Upgrade);
 
-    // get java version and vendor (prioritize release file, fallback to command)
-    let (mut vendor, mut version) = get_java_info_from_release_file(&java_exec_path);
-    if vendor.is_none() || version.is_none() {
-      let (cmd_vendor, cmd_version) = get_java_info_from_command(&java_exec_path);
+    // get Java version, vendor and architecture (prioritize release file, fallback to command)
+    let (mut vendor, mut version, mut arch) = get_java_info_from_release_file(&java_exec_path);
+    if vendor.is_none() || version.is_none() || arch.is_none() {
+      let (cmd_vendor, cmd_version, cmd_arch) = get_java_info_from_command(&java_exec_path);
       vendor = vendor.or(cmd_vendor);
       version = version.or(cmd_version);
+      arch = arch.or(cmd_arch);
     }
     let full_version = match version {
       Some(v) => v,
       None => continue, // if no version, skip as invalid
     };
     let vendor = vendor.unwrap_or_else(|| "Unknown Vendor".to_string());
+    let arch = arch
+      .map(|arch| normalize_java_arch(&arch))
+      .unwrap_or_else(|| tauri_plugin_os::arch().to_string());
 
     let java_path_buf = PathBuf::from(&java_exec_path);
     let java_bin_path = java_path_buf
@@ -70,6 +74,7 @@ pub async fn refresh_and_update_javas(app: &AppHandle) {
       is_lts,
       exec_path: java_exec_path.clone(),
       vendor,
+      arch,
       is_user_added,
     };
 
@@ -381,25 +386,40 @@ fn scan_java_paths_in_windows_registry() -> Vec<String> {
     .collect()
 }
 
-pub fn get_java_info_from_release_file(java_path: &str) -> (Option<String>, Option<String>) {
+fn normalize_java_arch(arch: &str) -> String {
+  match arch.trim().to_ascii_lowercase().as_str() {
+    "amd64" | "x64" | "x86-64" | "x86_64" => "x86_64".to_string(),
+    "arm64" | "aarch64" => "aarch64".to_string(),
+    "i386" | "i486" | "i586" | "i686" | "x86" => "x86".to_string(),
+    "arm32" | "armv6" | "armv6l" | "armv7" | "armv7l" | "arm" => "arm".to_string(),
+    "ppc64le" | "powerpc64le" => "powerpc64le".to_string(),
+    "ppc64" | "powerpc64" => "powerpc64".to_string(),
+    other => other.to_string(),
+  }
+}
+
+pub fn get_java_info_from_release_file(
+  java_path: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
   // Typically, executable files are located in .../Home/bin/java, release file and bin folder are at the same level.
   let java_path_buf = PathBuf::from(java_path);
   let java_home = match java_path_buf.parent().and_then(|p| p.parent()) {
     Some(p) => p,
-    None => return (None, None),
+    None => return (None, None, None),
   };
   let release_file = java_home.join("release");
 
   if !release_file.exists() {
-    return (None, None);
+    return (None, None, None);
   }
   let content = match fs::read_to_string(release_file) {
     Ok(c) => c,
-    Err(_) => return (None, None),
+    Err(_) => return (None, None, None),
   };
 
   let mut vendor = None;
   let mut full_version = None;
+  let mut arch = None;
 
   // Try to parse info from release file
   for line in content.lines() {
@@ -411,13 +431,20 @@ pub fn get_java_info_from_release_file(java_path: &str) -> (Option<String>, Opti
       && let Some(val) = line.split('=').nth(1)
     {
       vendor = Some(val.trim().trim_matches('"').to_string());
+    } else if let Some(val) = line.strip_prefix("OS_ARCH=") {
+      let val = val.trim().trim_matches('"');
+      if !val.is_empty() {
+        arch = Some(val.to_string());
+      }
     }
   }
 
-  (vendor, full_version)
+  (vendor, full_version, arch)
 }
 
-pub fn get_java_info_from_command(java_path: &str) -> (Option<String>, Option<String>) {
+pub fn get_java_info_from_command(
+  java_path: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
   // use "java -version -XshowSettings:properties" command to get info
   #[cfg(target_os = "windows")]
   let output = Command::new(java_path)
@@ -431,7 +458,7 @@ pub fn get_java_info_from_command(java_path: &str) -> (Option<String>, Option<St
 
   let output = match output {
     Ok(o) if o.status.success() => o,
-    _ => return (None, None),
+    _ => return (None, None, None),
   };
 
   let mut output_str = String::new();
@@ -440,6 +467,7 @@ pub fn get_java_info_from_command(java_path: &str) -> (Option<String>, Option<St
 
   let mut vendor = None;
   let mut full_version = None;
+  let mut arch = None;
 
   for line in output_str.lines() {
     let trimmed = line.trim();
@@ -453,9 +481,15 @@ pub fn get_java_info_from_command(java_path: &str) -> (Option<String>, Option<St
     {
       full_version = Some(val.trim().trim_matches('"').to_string());
     }
+    if let Some(val) = trimmed.strip_prefix("os.arch = ") {
+      let val = val.trim().trim_matches('"');
+      if !val.is_empty() {
+        arch = Some(val.to_string());
+      }
+    }
   }
 
-  (vendor, full_version)
+  (vendor, full_version, arch)
 }
 
 pub fn parse_java_major_version(full_version: &str) -> (i32, bool) {

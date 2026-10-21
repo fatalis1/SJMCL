@@ -437,6 +437,9 @@ pub fn validate_sha1(dest_path: PathBuf, truth: String) -> SJMCLResult<()> {
         e
       ))
     })?;
+  if truth.is_empty() {
+    return Ok(());
+  }
   let mut hasher = Sha1::new();
   std::io::copy(&mut f, &mut hasher)
     .map_err(|e| SJMCLError(format!("Failed to copy data for SHA1 validation: {}", e)))?;
