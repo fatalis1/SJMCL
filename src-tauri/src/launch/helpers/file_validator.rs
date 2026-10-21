@@ -79,6 +79,27 @@ pub fn get_native_library_artifacts(client_info: &McClientInfo) -> Vec<Downloads
   artifacts.into_iter().collect()
 }
 
+async fn library_file_is_valid(
+  path: &Path,
+  artifact: &DownloadsArtifact,
+  check_hash: bool,
+) -> SJMCLResult<bool> {
+  let metadata = match fs::metadata(path).await {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    Err(error) => return Err(error.into()),
+  };
+  if !metadata.is_file() {
+    return Ok(false);
+  }
+  if artifact.sha1.is_empty() {
+    return Ok(
+      metadata.len() > 0 && (artifact.size <= 0 || metadata.len() == artifact.size as u64),
+    );
+  }
+  Ok(!check_hash || validate_sha1(path.to_path_buf(), artifact.sha1.clone()).is_ok())
+}
+
 pub async fn get_invalid_library_files(
   source: SourceType,
   library_path: &Path,
@@ -91,8 +112,7 @@ pub async fn get_invalid_library_files(
 
   let futs = artifacts.into_iter().map(move |artifact| async move {
     let file_path = library_path.join(&artifact.path);
-    let exists = fs::try_exists(&file_path).await?;
-    if exists && (!check_hash || validate_sha1(file_path.clone(), artifact.sha1.clone()).is_ok()) {
+    if library_file_is_valid(&file_path, &artifact, check_hash).await? {
       Ok(None)
     } else if artifact.url.is_empty() {
       Err(LaunchError::GameFilesIncomplete.into())
@@ -112,7 +132,7 @@ pub async fn get_invalid_library_files(
         src,
         dest: file_path,
         filename: None,
-        sha1: Some(artifact.sha1.clone()),
+        sha1: (!artifact.sha1.is_empty()).then_some(artifact.sha1.clone()),
       })))
     }
   });
@@ -185,8 +205,7 @@ pub async fn get_invalid_windows_mesa_loader_file(
   };
 
   let file_path = library_path.join(&artifact.path);
-  let exists = fs::try_exists(&file_path).await?;
-  if exists && (!check_hash || validate_sha1(file_path.clone(), artifact.sha1.clone()).is_ok()) {
+  if library_file_is_valid(&file_path, &artifact, check_hash).await? {
     return Ok(Vec::new());
   }
 
@@ -199,7 +218,7 @@ pub async fn get_invalid_windows_mesa_loader_file(
     src,
     dest: file_path,
     filename: None,
-    sha1: Some(artifact.sha1),
+    sha1: (!artifact.sha1.is_empty()).then_some(artifact.sha1),
   })])
 }
 
@@ -256,7 +275,8 @@ pub fn merge_library_lists(
   libraries_a: &[LibrariesValue],
   libraries_b: &[LibrariesValue],
 ) -> Vec<LibrariesValue> {
-  let mut library_map: HashMap<LibraryKey, LibrariesValue> = HashMap::new();
+  let mut library_map: HashMap<LibraryKey, usize> = HashMap::new();
+  let mut result: Vec<LibrariesValue> = Vec::new();
 
   for library in libraries_a.iter().chain(libraries_b.iter()) {
     if let Ok(library_parts) = parse_library_name(&library.name, None) {
@@ -269,21 +289,22 @@ pub fn merge_library_lists(
 
       let new_version = library_parts.pack_version;
 
-      if let Some(existing_library) = library_map.get(&key) {
-        let existing_version = parse_library_name(&existing_library.name, None)
+      if let Some(&index) = library_map.get(&key) {
+        let existing_version = parse_library_name(&result[index].name, None)
           .map(|parts| parts.pack_version)
           .unwrap_or("0.1.0".to_string());
 
         if parse_sem_version(&new_version) > parse_sem_version(&existing_version) {
-          library_map.insert(key, library.clone());
+          result[index] = library.clone();
         }
       } else {
-        library_map.insert(key, library.clone());
+        library_map.insert(key, result.len());
+        result.push(library.clone());
       }
     }
   }
 
-  library_map.into_values().collect()
+  result
 }
 
 fn parse_sem_version(version: &str) -> Version {
