@@ -1,5 +1,4 @@
 use sjmcl_types::error::{SJMCLError, SJMCLResult};
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Component, Path};
@@ -88,26 +87,12 @@ async fn resolve_lwjgl3ify(app: &AppHandle, instance: &Instance) -> Option<(Stri
       .ok_or(InstanceError::InstanceNotFoundByID)?;
     let mods_dir = dirs[0].clone();
     let loader_type = instance.mod_loader.loader_type;
-    tokio::task::spawn_blocking(move || resolve_from_mods(&mods_dir, loader_type))
+    tokio::task::spawn_blocking(move || find_lwjgl3ify(&mods_dir, loader_type))
       .await
-      .map_err(SJMCLError::from)
+      .map_err(SJMCLError::from)?
   }
   .await;
   match result {
-    Ok(candidate) => candidate,
-    Err(error) => {
-      log::warn!("lwjgl3ify: takeover failed; using original launch profile: {error:?}");
-      None
-    }
-  }
-}
-
-fn is_candidate(version: &str, loader: ModLoaderType) -> bool {
-  version == "1.7.10" && matches!(loader, ModLoaderType::Forge | ModLoaderType::LegacyForge)
-}
-
-fn resolve_from_mods(mods_dir: &Path, loader: ModLoaderType) -> Option<(String, McClientInfo)> {
-  match find_lwjgl3ify(mods_dir, loader) {
     Ok(Some(profile)) => Some(profile),
     Ok(None) => {
       log::debug!("lwjgl3ify: no enabled mod found; using original launch profile");
@@ -118,6 +103,10 @@ fn resolve_from_mods(mods_dir: &Path, loader: ModLoaderType) -> Option<(String, 
       None
     }
   }
+}
+
+fn is_candidate(version: &str, loader: ModLoaderType) -> bool {
+  version == "1.7.10" && matches!(loader, ModLoaderType::Forge | ModLoaderType::LegacyForge)
 }
 
 fn lwjgl3ify_java_requirement(javas: &[JavaInfo], preferred: i32) -> i32 {
@@ -146,6 +135,7 @@ fn platform_name(os: &str, arch: &str) -> SJMCLResult<&'static str> {
   }
 }
 
+// version.json encodes arch in os.name (osx-arm64/windows-arm64); evaluate here, then clear library.rules for SJMCL.
 fn profile_library_allowed(library: &LibrariesValue, platform: &str) -> SJMCLResult<bool> {
   let mut allowed = library.rules.is_empty();
   for rule in &library.rules {
@@ -248,28 +238,27 @@ fn find_lwjgl3ify(
 }
 
 fn safe_library_path(name: &str, classifier: Option<String>) -> SJMCLResult<String> {
-  if !(3..=4).contains(
-    &name
-      .split('@')
-      .next()
-      .unwrap_or_default()
-      .split(':')
-      .count(),
-  ) || name.matches('@').count() > 1
-    || (classifier.is_some()
-      && name
-        .split('@')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .count()
-        == 4)
-    || name
-      .split([':', '@'])
-      .any(|part| part.is_empty() || part.contains(['/', '\\']) || part == "..")
-    || classifier
-      .as_ref()
-      .is_some_and(|part| part.is_empty() || part.contains(['/', '\\', ':', '@']) || part == "..")
+  let base_coord = name.split('@').next().unwrap_or_default();
+  let colon_parts = base_coord.split(':').count();
+  // Maven coordinates have three or four parts and at most one extension suffix.
+  if !(3..=4).contains(&colon_parts) || name.matches('@').count() > 1 {
+    return Err(SJMCLError("Invalid Maven coordinate".to_string()));
+  }
+  // An embedded classifier must not override a separate download classifier.
+  if colon_parts == 4 && classifier.is_some() {
+    return Err(SJMCLError("Invalid Maven coordinate".to_string()));
+  }
+  // Coordinate parts must stay within their own path components.
+  if name
+    .split([':', '@'])
+    .any(|part| part.is_empty() || part.contains(['/', '\\']) || part == "..")
+  {
+    return Err(SJMCLError("Invalid Maven coordinate".to_string()));
+  }
+  // A separate classifier cannot contain coordinate or path separators.
+  if classifier
+    .as_ref()
+    .is_some_and(|part| part.is_empty() || part.contains(['/', '\\', ':', '@']) || part == "..")
   {
     return Err(SJMCLError("Invalid Maven coordinate".to_string()));
   }
@@ -304,38 +293,49 @@ fn active_jvm(arguments: &[ArgumentsItem]) -> SJMCLResult<Vec<String>> {
 }
 
 fn strip_tweak_classes(arguments: Vec<ArgumentsItem>) -> Vec<ArgumentsItem> {
-  let mut removed = HashSet::new();
-  let mut values = arguments
-    .iter()
-    .flat_map(|argument| &argument.value)
+  clean_tweak_classes(arguments, false)
+}
+
+fn clean_tweak_classes(
+  mut arguments: Vec<ArgumentsItem>,
+  mut keep_fml: bool,
+) -> Vec<ArgumentsItem> {
+  // Keep each value's original group so its rules and position stay intact.
+  let values = arguments
+    .iter_mut()
     .enumerate()
-    .peekable();
-  while let Some((index, value)) = values.next() {
-    if value == "--tweakClass"
-      && values
-        .peek()
-        .is_some_and(|(_, next)| next.as_str() == FML_TWEAKER)
-    {
-      removed.insert(index);
-      removed.insert(values.next().unwrap().0);
-    } else if value.strip_prefix("--tweakClass=") == Some(FML_TWEAKER)
-      || (value == "--tweakClass" && values.peek().is_none())
-    {
-      removed.insert(index);
-    }
-  }
-  let mut index = 0;
-  arguments
-    .into_iter()
-    .filter_map(|mut argument| {
-      argument.value.retain(|_| {
-        let keep = !removed.contains(&index);
-        index += 1;
-        keep
-      });
-      (!argument.value.is_empty()).then_some(argument)
+    .flat_map(|(index, argument)| {
+      std::mem::take(&mut argument.value)
+        .into_iter()
+        .map(move |value| (index, value))
     })
-    .collect()
+    .collect::<Vec<_>>();
+  let mut values = values.into_iter().peekable();
+  while let Some((index, value)) = values.next() {
+    if value == "--tweakClass" {
+      match values.peek() {
+        Some((_, next)) if next == FML_TWEAKER => {
+          let (next_index, next) = values.next().unwrap();
+          if keep_fml {
+            arguments[index].value.push(value);
+            arguments[next_index].value.push(next);
+            keep_fml = false;
+          }
+          continue;
+        }
+        None => continue,
+        _ => {}
+      }
+    } else if value.strip_prefix("--tweakClass=") == Some(FML_TWEAKER) {
+      if !keep_fml {
+        continue;
+      }
+      keep_fml = false;
+    }
+    arguments[index].value.push(value);
+  }
+  arguments.retain(|argument| !argument.value.is_empty());
+  arguments
 }
 
 fn normalize_forge_version(version: &str) -> &str {
@@ -449,17 +449,21 @@ fn apply_profile(
         .is_ok_and(|parts| parts.classifier.as_deref() == Some("forgePatches"))
     })
     .collect::<Vec<_>>();
-  if patches.len() != 1
-    || !patches[0]
-      .downloads
-      .as_ref()
-      .and_then(|d| d.artifact.as_ref())
-      .is_some_and(|artifact| {
-        url::Url::parse(&artifact.url).is_ok_and(|url| matches!(url.scheme(), "https" | "http"))
-      })
-  {
+  if patches.len() != 1 {
     return Err(SJMCLError(
       "Missing unique downloadable forgePatches library".to_string(),
+    ));
+  }
+  if !patches[0]
+    .downloads
+    .as_ref()
+    .and_then(|d| d.artifact.as_ref())
+    .is_some_and(|artifact| {
+      url::Url::parse(&artifact.url).is_ok_and(|url| matches!(url.scheme(), "https" | "http"))
+    })
+  {
+    return Err(SJMCLError(
+      "Missing downloadable forgePatches artifact (legacy Maven-style lwjgl3ify metadata without downloads is unsupported)".to_string(),
     ));
   }
   let patch_name = patches[0].name.clone();
@@ -529,9 +533,9 @@ fn apply_profile(
     .filter(|args| !args.game.is_empty())
   {
     validate_rules(&old.game)?;
-    strip_tweak_classes(old.game.clone())
+    clean_tweak_classes(old.game.clone(), true)
   } else if let Some(legacy) = &original.minecraft_arguments {
-    strip_tweak_classes(
+    clean_tweak_classes(
       shlex::split(legacy)
         .ok_or_else(|| SJMCLError("Invalid legacy game arguments".to_string()))?
         .into_iter()
@@ -540,6 +544,7 @@ fn apply_profile(
           ..Default::default()
         })
         .collect(),
+      true,
     )
   } else {
     metadata_game.clone()
@@ -554,10 +559,22 @@ fn apply_profile(
       game.push(argument);
     }
   }
-  game.push(ArgumentsItem {
-    value: vec!["--tweakClass".to_string(), FML_TWEAKER.to_string()],
-    ..Default::default()
-  });
+  let game_values = game
+    .iter()
+    .flat_map(|argument| &argument.value)
+    .collect::<Vec<_>>();
+  if !game_values
+    .windows(2)
+    .any(|pair| pair[0] == "--tweakClass" && pair[1] == FML_TWEAKER)
+    && !game_values
+      .iter()
+      .any(|value| value.strip_prefix("--tweakClass=") == Some(FML_TWEAKER))
+  {
+    game.push(ArgumentsItem {
+      value: vec!["--tweakClass".to_string(), FML_TWEAKER.to_string()],
+      ..Default::default()
+    });
+  }
   arguments.game = game;
   let java = profile
     .java_version
@@ -572,6 +589,6 @@ fn apply_profile(
     major_version: java.major_version.max(17),
     ..java
   });
-  log::info!("lwjgl3ify: discarded_profile_jvm_arguments={discarded_jvm_count}");
+  log::info!("lwjgl3ify: discarded_original_jvm_arguments={discarded_jvm_count}");
   Ok(result)
 }
