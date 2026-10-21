@@ -17,6 +17,7 @@ use crate::instance::helpers::game_version::compare_game_versions;
 use crate::instance::helpers::misc::get_instance_subdir_paths;
 use crate::instance::models::misc::{InstanceError, InstanceSubdirType};
 use crate::launch::helpers::file_validator::get_nonnative_library_paths;
+use crate::launch::helpers::lwjgl3ify::sanitize_lwjgl3ify_jvm;
 use crate::launch::helpers::misc::{get_separator, replace_arguments};
 use crate::launch::models::{LaunchError, LaunchingState};
 use crate::launcher_config::models::*;
@@ -122,6 +123,7 @@ pub async fn generate_launch_command(
     game_config,
     client_info,
     auth_server_meta,
+    lwjgl3ify,
     ..
   } = launching;
   let selected_player = launching
@@ -169,8 +171,10 @@ pub async fn generate_launch_command(
     selected_instance.mod_loader.loader_type,
   )?
   .into_iter()
-  .collect::<HashSet<_>>()
-  .into_iter()
+  .filter({
+    let mut seen = HashSet::new();
+    move |path| seen.insert(path.clone())
+  })
   .map(|p| p.to_string_lossy().to_string())
   .collect();
   class_paths.push(client_jar_path.clone());
@@ -263,7 +267,16 @@ pub async fn generate_launch_command(
     }
 
     if !jvm.args.is_empty() {
-      cmd.extend(jvm.args.split_whitespace().map(|s| s.to_string()));
+      let args = jvm
+        .args
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+      cmd.extend(if lwjgl3ify {
+        sanitize_lwjgl3ify_jvm(args)
+      } else {
+        args
+      });
     }
   }
 

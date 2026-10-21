@@ -32,13 +32,18 @@ use crate::launch::helpers::graphics_handler::{
 };
 use crate::launch::helpers::jre_selector::select_java_runtime;
 use crate::launch::helpers::log_parser::parse_crash_report_path_from_log;
+use crate::launch::helpers::lwjgl3ify::{
+  accept_lwjgl3ify_java, apply_profile, lwjgl3ify_java_requirement, resolve_lwjgl3ify,
+};
 use crate::launch::helpers::misc::get_separator;
 use crate::launch::helpers::process_monitor::{
   kill_process, monitor_process, set_process_priority,
 };
 use crate::launch::models::{LaunchError, LaunchingState};
 use crate::launcher_config::helpers::java::refresh_and_update_javas;
-use crate::launcher_config::models::{FileValidatePolicy, LauncherConfig, LauncherVisiablity};
+use crate::launcher_config::models::{
+  FileValidatePolicy, JavaInfo, LauncherConfig, LauncherVisiablity,
+};
 use crate::resource::helpers::misc::get_source_priority_list;
 use crate::tasks::commands::schedule_progressive_task_group;
 use crate::utils::fs::create_zip_from_dirs;
@@ -67,20 +72,86 @@ pub async fn select_suitable_jre(
   let client_path = instance
     .version_path
     .join(format!("{}.json", instance.name));
-  let client_info = load_json_async::<McClientInfo>(&client_path).await?;
+  let mut client_info = load_json_async::<McClientInfo>(&client_path).await?;
+  let candidate = resolve_lwjgl3ify(&app, &instance).await;
 
   refresh_and_update_javas(&app).await;
 
-  let selected_java = select_java_runtime(
+  let mut java_requirement = candidate
+    .as_ref()
+    .map_or(&client_info, |(_, profile)| profile)
+    .java_version
+    .as_ref()
+    .map_or(0, |java| java.major_version);
+  if candidate.is_some() && game_config.game_java.auto {
+    let javas = app.state::<Mutex<Vec<JavaInfo>>>();
+    java_requirement = lwjgl3ify_java_requirement(&javas.lock()?, java_requirement);
+  }
+  let selection = select_java_runtime(
     &app,
     Some(&game_config.game_java),
     &instance,
-    client_info
-      .java_version
-      .as_ref()
-      .map_or(0i32, |v| v.major_version),
+    java_requirement,
   )
-  .await?;
+  .await;
+  let has_lwjgl3ify_metadata = candidate.is_some();
+  let (mut selected_java, mut lwjgl3ify) =
+    match accept_lwjgl3ify_java(has_lwjgl3ify_metadata, selection) {
+      Ok(result) => result,
+      Err(error) if has_lwjgl3ify_metadata => {
+        log::warn!(
+          "lwjgl3ify: Java selection failed ({error:?}); retrying original launch profile"
+        );
+        let selection = select_java_runtime(
+          &app,
+          Some(&game_config.game_java),
+          &instance,
+          client_info
+            .java_version
+            .as_ref()
+            .map_or(0, |java| java.major_version),
+        )
+        .await;
+        accept_lwjgl3ify_java(false, selection)?
+      }
+      Err(error) => return Err(error),
+    };
+  if lwjgl3ify && let Some((version, profile)) = candidate {
+    match apply_profile(&client_info, profile, &selected_java.arch) {
+      Ok(profile) => {
+        client_info = profile;
+        log::info!(
+          "lwjgl3ify: version={version}, Java={}, arch={}, main_class={:?}, first_libraries={:?}",
+          selected_java.major_version,
+          selected_java.arch,
+          client_info.main_class,
+          client_info
+            .libraries
+            .iter()
+            .take(3)
+            .map(|library| library.name.as_str())
+            .collect::<Vec<_>>()
+        );
+      }
+      Err(error) => {
+        log::warn!(
+          "lwjgl3ify: profile application failed ({error:?}); retrying original launch profile"
+        );
+        lwjgl3ify = false;
+        let selection = select_java_runtime(
+          &app,
+          Some(&game_config.game_java),
+          &instance,
+          client_info
+            .java_version
+            .as_ref()
+            .map_or(0, |java| java.major_version),
+        )
+        .await;
+        selected_java = accept_lwjgl3ify_java(false, selection)?.0;
+      }
+    }
+  }
 
   let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
   let mut launching = launching_queue_state.lock()?;
@@ -88,6 +159,7 @@ pub async fn select_suitable_jre(
     id: timestamp,
     game_config,
     client_info,
+    lwjgl3ify,
     selected_java,
     selected_instance: instance,
     ..LaunchingState::default()
