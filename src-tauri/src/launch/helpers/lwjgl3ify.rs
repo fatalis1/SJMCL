@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Component, Path};
-use tauri::AppHandle;
+use std::sync::Mutex;
+use tauri::{AppHandle, Manager};
 use zip::ZipArchive;
 
 use crate::instance::helpers::client_json::{
@@ -16,7 +17,9 @@ use crate::instance::models::misc::{Instance, InstanceError, InstanceSubdirType,
 use crate::launch::helpers::file_validator::{
   convert_library_name_to_path, merge_library_lists, parse_library_name,
 };
-use crate::launcher_config::models::JavaInfo;
+use crate::launch::helpers::jre_selector::select_java_runtime;
+use crate::launch::helpers::misc::sanitize_managed_jvm_arguments;
+use crate::launcher_config::models::{GameJava, JavaInfo};
 
 const RESOURCE_ROOT: &str = "me/eigenraven/lwjgl3ify/relauncher/";
 const RFB_MAIN: &str = "com.gtnewhorizons.retrofuturabootstrap.MainStartOnFirstThread";
@@ -25,11 +28,63 @@ const RFB_LOADER: &str =
   "-Djava.system.class.loader=com.gtnewhorizons.retrofuturabootstrap.RfbSystemClassLoader";
 const FML_TWEAKER: &str = "cpw.mods.fml.common.launcher.FMLTweaker";
 
-// A failed optional takeover never changes the original instance's launch profile.
-pub async fn resolve_lwjgl3ify(
+pub async fn resolve_launch_profile(
   app: &AppHandle,
   instance: &Instance,
-) -> Option<(String, McClientInfo)> {
+  game_java: &GameJava,
+  client_info: McClientInfo,
+) -> SJMCLResult<(McClientInfo, JavaInfo, bool)> {
+  let original_requirement = client_info
+    .java_version
+    .as_ref()
+    .map_or(0, |java| java.major_version);
+  if let Some((version, profile)) = resolve_lwjgl3ify(app, instance).await {
+    let mut requirement = profile
+      .java_version
+      .as_ref()
+      .map_or(17, |java| java.major_version.max(17));
+    if game_java.auto {
+      let javas = app.state::<Mutex<Vec<JavaInfo>>>();
+      requirement = lwjgl3ify_java_requirement(&javas.lock()?, requirement);
+    }
+    match select_java_runtime(app, Some(game_java), instance, requirement).await {
+      Ok(java) if java.major_version >= 17 => {
+        match apply_profile(&client_info, profile, &java.arch) {
+          Ok(profile) => {
+            log::info!(
+              "lwjgl3ify: version={version}, Java={}, arch={}, main_class={:?}, first_libraries={:?}",
+              java.major_version,
+              java.arch,
+              profile.main_class,
+              profile
+                .libraries
+                .iter()
+                .take(3)
+                .map(|library| library.name.as_str())
+                .collect::<Vec<_>>()
+            );
+            return Ok((profile, java, true));
+          }
+          Err(error) => log::warn!(
+            "lwjgl3ify: profile application failed ({error:?}); retrying original launch profile"
+          ),
+        }
+      }
+      Ok(java) => log::warn!(
+        "lwjgl3ify: selected Java {} is below 17; retrying original launch profile",
+        java.major_version
+      ),
+      Err(error) => {
+        log::warn!("lwjgl3ify: Java selection failed ({error:?}); retrying original launch profile")
+      }
+    }
+  }
+  let java = select_java_runtime(app, Some(game_java), instance, original_requirement).await?;
+  Ok((client_info, java, false))
+}
+
+// A failed optional takeover never changes the original instance's launch profile.
+async fn resolve_lwjgl3ify(app: &AppHandle, instance: &Instance) -> Option<(String, McClientInfo)> {
   if !is_candidate(&instance.version, instance.mod_loader.loader_type) {
     return None;
   }
@@ -70,28 +125,13 @@ fn resolve_from_mods(mods_dir: &Path, loader: ModLoaderType) -> Option<(String, 
   }
 }
 
-pub fn lwjgl3ify_java_requirement(javas: &[JavaInfo], preferred: i32) -> i32 {
+fn lwjgl3ify_java_requirement(javas: &[JavaInfo], preferred: i32) -> i32 {
   let preferred = preferred.max(17);
   if javas.iter().any(|java| java.major_version >= preferred) {
     return preferred;
   }
   log::warn!("lwjgl3ify: no scanned Java >= {preferred}; lowering the selection minimum to 17");
   17
-}
-
-pub fn accept_lwjgl3ify_java(
-  has_metadata: bool,
-  selection: SJMCLResult<JavaInfo>,
-) -> SJMCLResult<(JavaInfo, bool)> {
-  let java = selection?;
-  if has_metadata && java.major_version < 17 {
-    log::warn!(
-      "lwjgl3ify: selected Java {} is below 17; using original launch profile",
-      java.major_version
-    );
-    return Ok((java, false));
-  }
-  Ok((java, has_metadata))
 }
 
 fn platform_name(os: &str, arch: &str) -> SJMCLResult<&'static str> {
@@ -168,12 +208,7 @@ fn find_lwjgl3ify(
     {
       continue;
     }
-    if path.parent() != Some(mods_dir)
-      && path
-        .parent()
-        .and_then(Path::file_name)
-        .is_none_or(|name| name != "1.7.10")
-    {
+    if path.parent() != Some(mods_dir) && path.parent() != Some(mods_dir.join("1.7.10").as_path()) {
       continue;
     }
     let metadata = (|| -> SJMCLResult<_> {
@@ -273,34 +308,6 @@ fn active_jvm(arguments: &[ArgumentsItem]) -> SJMCLResult<Vec<String>> {
   Ok(result)
 }
 
-// JVM argument values are discrete strings; discard conflicting switches and operands.
-pub fn sanitize_lwjgl3ify_jvm(arguments: Vec<String>) -> Vec<String> {
-  let mut result = Vec::new();
-  let mut args = arguments.into_iter();
-  while let Some(argument) = args.next() {
-    if matches!(
-      argument.as_str(),
-      "-cp" | "-classpath" | "--class-path" | "-jar"
-    ) {
-      log::warn!("lwjgl3ify: discarding user JVM option {argument} and its operand");
-      args.next();
-    } else if ["-cp=", "-classpath=", "--class-path=", "-jar="]
-      .iter()
-      .any(|prefix| argument.starts_with(prefix))
-    {
-      log::warn!("lwjgl3ify: discarding user JVM option {argument}");
-    } else if argument.starts_with("-Djava.system.class.loader=") {
-      if argument != RFB_LOADER {
-        log::warn!("lwjgl3ify: discarding user classloader override {argument}");
-      }
-      // The validated metadata supplies the single authoritative RFB classloader.
-    } else {
-      result.push(argument);
-    }
-  }
-  result
-}
-
 fn strip_tweak_classes(arguments: Vec<ArgumentsItem>) -> Vec<ArgumentsItem> {
   let mut removed = HashSet::new();
   let mut values = arguments
@@ -341,7 +348,7 @@ fn normalize_forge_version(version: &str) -> &str {
   version.strip_suffix("-1.7.10").unwrap_or(version)
 }
 
-pub(crate) fn apply_profile(
+fn apply_profile(
   original: &McClientInfo,
   mut profile: McClientInfo,
   java_arch: &str,
@@ -510,7 +517,7 @@ pub(crate) fn apply_profile(
     .transpose()?
     .unwrap_or_default();
   let old_jvm_count = old_jvm.len();
-  let mut jvm = sanitize_lwjgl3ify_jvm(old_jvm);
+  let mut jvm = sanitize_managed_jvm_arguments(old_jvm);
   let discarded_jvm_count = old_jvm_count - jvm.len();
   jvm.extend(managed);
   arguments.jvm = jvm
@@ -570,6 +577,6 @@ pub(crate) fn apply_profile(
     major_version: java.major_version.max(17),
     ..java
   });
-  log::info!("lwjgl3ify: discarded_user_jvm_arguments={discarded_jvm_count}");
+  log::info!("lwjgl3ify: discarded_profile_jvm_arguments={discarded_jvm_count}");
   Ok(result)
 }

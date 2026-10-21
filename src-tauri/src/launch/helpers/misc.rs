@@ -2,6 +2,30 @@ use lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
 
+// A managed profile owns the classpath, entry point and system classloader.
+pub fn sanitize_managed_jvm_arguments(arguments: Vec<String>) -> Vec<String> {
+  let mut result = Vec::new();
+  let mut args = arguments.into_iter();
+  while let Some(argument) = args.next() {
+    if matches!(
+      argument.as_str(),
+      "-cp" | "-classpath" | "--class-path" | "-jar"
+    ) {
+      log::warn!("Discarding JVM option {argument} and its operand: managed launch profile");
+      args.next();
+    } else if ["-cp=", "-classpath=", "--class-path=", "-jar="]
+      .iter()
+      .any(|prefix| argument.starts_with(prefix))
+      || argument.starts_with("-Djava.system.class.loader=")
+    {
+      log::warn!("Discarding JVM option {argument}: managed launch profile");
+    } else {
+      result.push(argument);
+    }
+  }
+  result
+}
+
 pub fn replace_arguments(args: Vec<String>, map: &HashMap<String, String>) -> Vec<String> {
   lazy_static::lazy_static!(
     static ref PARAM_REGEX: Regex = Regex::new(r"\$\{([^}]+)\}").unwrap();
