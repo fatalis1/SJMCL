@@ -91,8 +91,33 @@ pub async fn get_invalid_library_files(
 
   let futs = artifacts.into_iter().map(move |artifact| async move {
     let file_path = library_path.join(&artifact.path);
-    let exists = fs::try_exists(&file_path).await?;
-    if exists && (!check_hash || validate_sha1(file_path.clone(), artifact.sha1.clone()).is_ok()) {
+    let valid = if artifact.sha1.is_empty() {
+      let metadata = match fs::metadata(&file_path).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+      };
+      if metadata.is_none_or(|metadata| !metadata.is_file() || metadata.len() == 0) {
+        false
+      } else if file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar") || ext.eq_ignore_ascii_case("zip"))
+      {
+        let path = file_path.clone();
+        tokio::task::spawn_blocking(move || {
+          std::fs::File::open(path)
+            .is_ok_and(|file| ZipArchive::new(std::io::BufReader::new(file)).is_ok())
+        })
+        .await?
+      } else {
+        true
+      }
+    } else {
+      fs::try_exists(&file_path).await?
+        && (!check_hash || validate_sha1(file_path.clone(), artifact.sha1.clone()).is_ok())
+    };
+    if valid {
       Ok(None)
     } else if artifact.url.is_empty() {
       Err(LaunchError::GameFilesIncomplete.into())
@@ -112,7 +137,7 @@ pub async fn get_invalid_library_files(
         src,
         dest: file_path,
         filename: None,
-        sha1: Some(artifact.sha1.clone()),
+        sha1: (!artifact.sha1.is_empty()).then_some(artifact.sha1.clone()),
       })))
     }
   });
@@ -256,7 +281,8 @@ pub fn merge_library_lists(
   libraries_a: &[LibrariesValue],
   libraries_b: &[LibrariesValue],
 ) -> Vec<LibrariesValue> {
-  let mut library_map: HashMap<LibraryKey, LibrariesValue> = HashMap::new();
+  let mut library_map: HashMap<LibraryKey, usize> = HashMap::new();
+  let mut result: Vec<LibrariesValue> = Vec::new();
 
   for library in libraries_a.iter().chain(libraries_b.iter()) {
     if let Ok(library_parts) = parse_library_name(&library.name, None) {
@@ -269,21 +295,22 @@ pub fn merge_library_lists(
 
       let new_version = library_parts.pack_version;
 
-      if let Some(existing_library) = library_map.get(&key) {
-        let existing_version = parse_library_name(&existing_library.name, None)
+      if let Some(&index) = library_map.get(&key) {
+        let existing_version = parse_library_name(&result[index].name, None)
           .map(|parts| parts.pack_version)
           .unwrap_or("0.1.0".to_string());
 
         if parse_sem_version(&new_version) > parse_sem_version(&existing_version) {
-          library_map.insert(key, library.clone());
+          result[index] = library.clone();
         }
       } else {
-        library_map.insert(key, library.clone());
+        library_map.insert(key, result.len());
+        result.push(library.clone());
       }
     }
   }
 
-  library_map.into_values().collect()
+  result
 }
 
 fn parse_sem_version(version: &str) -> Version {
