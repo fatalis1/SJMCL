@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sjmcl_types::error::{SJMCLError, SJMCLResult};
-use std::io::{Read, Seek};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use tokio;
 use zip::ZipArchive;
@@ -26,6 +26,27 @@ pub struct LegacyForgeModMetadata {
   pub update_url: Option<String>,
   pub credits: Option<String>,
   pub author_list: Option<Vec<Value>>,
+}
+
+#[derive(Deserialize)]
+struct LegacyForgeModContainer {
+  #[serde(rename = "modList")]
+  mods: Vec<LegacyForgeModMetadata>,
+}
+
+pub fn parse_legacy_forge_mod_metadata_bytes(
+  bytes: &[u8],
+) -> SJMCLResult<Vec<LegacyForgeModMetadata>> {
+  if bytes
+    .iter()
+    .copied()
+    .find(|byte| !byte.is_ascii_whitespace())
+    == Some(b'{')
+  {
+    Ok(serde_json::from_slice::<LegacyForgeModContainer>(bytes)?.mods)
+  } else {
+    Ok(serde_json::from_slice(bytes)?)
+  }
 }
 
 impl From<LegacyForgeModMetadata> for LocalModInfo {
@@ -51,12 +72,17 @@ impl LocalModMetadataParser for LegacyForgeModMetadataParser {
   fn get_mod_metadata_from_jar<R: Read + Seek>(
     jar: &mut ZipArchive<R>,
   ) -> SJMCLResult<Self::Metadata> {
-    let mut meta: Vec<LegacyForgeModMetadata> = match jar.by_name("mcmod.info") {
-      Ok(val) => match serde_json::from_reader(val) {
-        Ok(val) => val,
-        Err(e) => return Err(SJMCLError::from(e)),
-      },
-      Err(e) => return Err(SJMCLError::from(e)),
+    let is_container = BufReader::new(jar.by_name("mcmod.info")?)
+      .bytes()
+      .find(|byte| !matches!(byte, Ok(byte) if byte.is_ascii_whitespace()))
+      .transpose()?
+      == Some(b'{');
+    // Reopen the entry so serde_json sees the original whitespace and reports exact positions.
+    let reader = BufReader::new(jar.by_name("mcmod.info")?);
+    let mut meta = if is_container {
+      serde_json::from_reader::<_, LegacyForgeModContainer>(reader)?.mods
+    } else {
+      serde_json::from_reader::<_, Vec<LegacyForgeModMetadata>>(reader)?
     };
     if meta.is_empty() {
       return Err(SJMCLError("len of LegacyForgeModMetadata is 0".to_string()));
@@ -66,14 +92,8 @@ impl LocalModMetadataParser for LegacyForgeModMetadataParser {
 
   async fn get_mod_metadata_from_dir(dir_path: &Path) -> SJMCLResult<Self::Metadata> {
     let legacy_forge_file_path = dir_path.join("mcmod.info");
-    let mut meta: Vec<LegacyForgeModMetadata> =
-      match tokio::fs::read_to_string(legacy_forge_file_path).await {
-        Ok(val) => match serde_json::from_str(val.as_str()) {
-          Ok(val) => val,
-          Err(e) => return Err(SJMCLError::from(e)),
-        },
-        Err(e) => return Err(SJMCLError::from(e)),
-      };
+    let contents = tokio::fs::read(legacy_forge_file_path).await?;
+    let mut meta = parse_legacy_forge_mod_metadata_bytes(&contents)?;
     if meta.is_empty() {
       return Err(SJMCLError("len of LegacyForgeModMetadata is 0".to_string()));
     }
