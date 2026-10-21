@@ -7,7 +7,8 @@ use tauri::{AppHandle, Manager};
 use zip::ZipArchive;
 
 use crate::instance::helpers::client_json::{
-  ArgumentsItem, FeaturesInfo, IsAllowed, JavaVersion, LibrariesValue, McClientInfo,
+  ArgumentsItem, DownloadsArtifact, FeaturesInfo, IsAllowed, JavaVersion, LibrariesValue,
+  McClientInfo,
 };
 use crate::instance::helpers::misc::get_instance_subdir_paths;
 use crate::instance::helpers::mods::common::discover_local_mod_paths;
@@ -315,10 +316,9 @@ fn clean_tweak_classes(
     if value == "--tweakClass" {
       match values.peek() {
         Some((_, next)) if next == FML_TWEAKER => {
-          let (next_index, next) = values.next().unwrap();
+          let (_, next) = values.next().unwrap();
           if keep_fml {
-            arguments[index].value.push(value);
-            arguments[next_index].value.push(next);
+            arguments[index].value.extend([value, next]);
             keep_fml = false;
           }
           continue;
@@ -430,6 +430,41 @@ fn apply_profile(
     // The normal downloader/classpath evaluator only recognizes standard OS names.
     library.rules.clear();
     let path = safe_library_path(&library.name, None)?;
+    if library.downloads.as_ref().is_none_or(|downloads| {
+      downloads.artifact.is_none()
+        && downloads
+          .classifiers
+          .as_ref()
+          .is_none_or(|classifiers| classifiers.is_empty())
+    }) {
+      let is_patch = parse_library_name(&library.name, None)?
+        .classifier
+        .as_deref()
+        == Some("forgePatches");
+      let repository = library
+        .url
+        .as_deref()
+        .or_else(|| (!is_patch).then_some("https://libraries.minecraft.net/"));
+      if let Some(repository) = repository {
+        let mut base = url::Url::parse(repository)?;
+        if !matches!(base.scheme(), "https" | "http") || !base.has_host() {
+          return Err(SJMCLError("Invalid Maven repository URL".to_string()));
+        }
+        // Append Maven path components without treating reserved characters as URL syntax.
+        base
+          .path_segments_mut()
+          .map_err(|_| SJMCLError("Invalid Maven repository URL".to_string()))?
+          .pop_if_empty()
+          .extend(path.split('/'));
+        let downloads = library.downloads.get_or_insert_with(Default::default);
+        downloads.artifact = Some(DownloadsArtifact {
+          path: path.clone(),
+          url: base.to_string(),
+          sha1: String::new(),
+          size: 0,
+        });
+      }
+    }
     if let Some(downloads) = &mut library.downloads {
       if let Some(artifact) = &mut downloads.artifact {
         artifact.path = path;
@@ -451,7 +486,7 @@ fn apply_profile(
     .collect::<Vec<_>>();
   if patches.len() != 1 {
     return Err(SJMCLError(
-      "Missing unique downloadable forgePatches library".to_string(),
+      "Missing unique forgePatches library".to_string(),
     ));
   }
   if !patches[0]
@@ -463,7 +498,7 @@ fn apply_profile(
     })
   {
     return Err(SJMCLError(
-      "Missing downloadable forgePatches artifact (legacy Maven-style lwjgl3ify metadata without downloads is unsupported)".to_string(),
+      "Missing downloadable forgePatches artifact".to_string(),
     ));
   }
   let patch_name = patches[0].name.clone();
@@ -559,17 +594,16 @@ fn apply_profile(
       game.push(argument);
     }
   }
-  let game_values = game
-    .iter()
-    .flat_map(|argument| &argument.value)
-    .collect::<Vec<_>>();
-  if !game_values
-    .windows(2)
-    .any(|pair| pair[0] == "--tweakClass" && pair[1] == FML_TWEAKER)
-    && !game_values
-      .iter()
-      .any(|value| value.strip_prefix("--tweakClass=") == Some(FML_TWEAKER))
-  {
+  if !game.iter().any(|argument| {
+    argument
+      .value
+      .windows(2)
+      .any(|pair| pair[0] == "--tweakClass" && pair[1] == FML_TWEAKER)
+      || argument
+        .value
+        .iter()
+        .any(|value| value.strip_prefix("--tweakClass=") == Some(FML_TWEAKER))
+  }) {
     game.push(ArgumentsItem {
       value: vec!["--tweakClass".to_string(), FML_TWEAKER.to_string()],
       ..Default::default()
