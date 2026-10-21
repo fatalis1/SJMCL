@@ -28,16 +28,12 @@ const RFB_LOADER: &str =
   "-Djava.system.class.loader=com.gtnewhorizons.retrofuturabootstrap.RfbSystemClassLoader";
 const FML_TWEAKER: &str = "cpw.mods.fml.common.launcher.FMLTweaker";
 
-pub async fn resolve_launch_profile(
+pub async fn try_apply_lwjgl3ify(
   app: &AppHandle,
   instance: &Instance,
   game_java: &GameJava,
-  client_info: McClientInfo,
-) -> SJMCLResult<(McClientInfo, JavaInfo, bool)> {
-  let original_requirement = client_info
-    .java_version
-    .as_ref()
-    .map_or(0, |java| java.major_version);
+  client_info: &McClientInfo,
+) -> SJMCLResult<Option<(McClientInfo, JavaInfo)>> {
   if let Some((version, profile)) = resolve_lwjgl3ify(app, instance).await {
     let mut requirement = profile
       .java_version
@@ -49,7 +45,7 @@ pub async fn resolve_launch_profile(
     }
     match select_java_runtime(app, Some(game_java), instance, requirement).await {
       Ok(java) if java.major_version >= 17 => {
-        match apply_profile(&client_info, profile, &java.arch) {
+        match apply_profile(client_info, profile, &java.arch) {
           Ok(profile) => {
             log::info!(
               "lwjgl3ify: version={version}, Java={}, arch={}, main_class={:?}, first_libraries={:?}",
@@ -63,7 +59,7 @@ pub async fn resolve_launch_profile(
                 .map(|library| library.name.as_str())
                 .collect::<Vec<_>>()
             );
-            return Ok((profile, java, true));
+            return Ok(Some((profile, java)));
           }
           Err(error) => log::warn!(
             "lwjgl3ify: profile application failed ({error:?}); retrying original launch profile"
@@ -79,8 +75,7 @@ pub async fn resolve_launch_profile(
       }
     }
   }
-  let java = select_java_runtime(app, Some(game_java), instance, original_requirement).await?;
-  Ok((client_info, java, false))
+  Ok(None)
 }
 
 // A failed optional takeover never changes the original instance's launch profile.
@@ -517,7 +512,7 @@ fn apply_profile(
     .transpose()?
     .unwrap_or_default();
   let old_jvm_count = old_jvm.len();
-  let mut jvm = sanitize_managed_jvm_arguments(old_jvm);
+  let mut jvm = sanitize_managed_jvm_arguments(old_jvm, &managed);
   let discarded_jvm_count = old_jvm_count - jvm.len();
   jvm.extend(managed);
   arguments.jvm = jvm

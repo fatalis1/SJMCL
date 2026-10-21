@@ -273,11 +273,12 @@ pub async fn generate_launch_command(
         .split_whitespace()
         .map(str::to_string)
         .collect::<Vec<_>>();
-      cmd.extend(if profile_managed_jvm {
-        sanitize_managed_jvm_arguments(args)
+      let args = if profile_managed_jvm {
+        sanitize_managed_jvm_arguments(args, &cmd)
       } else {
         args
-      });
+      };
+      cmd.extend(args);
     }
   }
 
