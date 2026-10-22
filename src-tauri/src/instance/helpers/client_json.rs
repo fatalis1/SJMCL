@@ -61,7 +61,7 @@ pub struct LaunchArgumentTemplate {
   pub jvm: Vec<ArgumentsItem>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArgumentsItem {
   pub value: Vec<String>,
   pub rules: Vec<InstructionRule>,
@@ -119,7 +119,7 @@ impl Serialize for ArgumentsItem {
 }
 
 #[serialize_skip_none]
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InstructionRule {
   pub action: String,
@@ -208,7 +208,7 @@ impl InstructionRule {
 }
 
 #[serialize_skip_none]
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OsInfo {
   pub name: String,
@@ -217,7 +217,7 @@ pub struct OsInfo {
 }
 
 #[serialize_skip_none]
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct FeaturesInfo {
   pub is_demo_user: Option<bool>,
@@ -251,6 +251,7 @@ pub struct DownloadsValue {
 #[serde(rename_all = "camelCase", default)]
 pub struct LibrariesValue {
   pub name: String,
+  pub url: Option<String>,
   pub downloads: Option<LibrariesDownloads>,
   pub natives: Option<HashMap<String, String>>,
   pub extract: Option<LibrariesExtract>,

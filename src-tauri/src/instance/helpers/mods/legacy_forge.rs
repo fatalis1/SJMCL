@@ -28,6 +28,28 @@ pub struct LegacyForgeModMetadata {
   pub author_list: Option<Vec<Value>>,
 }
 
+#[derive(Deserialize)]
+struct LegacyForgeModContainer {
+  #[serde(rename = "modList")]
+  mods: Vec<LegacyForgeModMetadata>,
+}
+
+pub fn parse_legacy_forge_mod_metadata_bytes(
+  bytes: &[u8],
+) -> SJMCLResult<Vec<LegacyForgeModMetadata>> {
+  let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+  if bytes
+    .iter()
+    .copied()
+    .find(|byte| !byte.is_ascii_whitespace())
+    == Some(b'{')
+  {
+    Ok(serde_json::from_slice::<LegacyForgeModContainer>(bytes)?.mods)
+  } else {
+    Ok(serde_json::from_slice(bytes)?)
+  }
+}
+
 impl From<LegacyForgeModMetadata> for LocalModInfo {
   fn from(meta: LegacyForgeModMetadata) -> Self {
     Self {
@@ -51,29 +73,19 @@ impl LocalModMetadataParser for LegacyForgeModMetadataParser {
   fn get_mod_metadata_from_jar<R: Read + Seek>(
     jar: &mut ZipArchive<R>,
   ) -> SJMCLResult<Self::Metadata> {
-    let mut meta: Vec<LegacyForgeModMetadata> = match jar.by_name("mcmod.info") {
-      Ok(val) => match serde_json::from_reader(val) {
-        Ok(val) => val,
-        Err(e) => return Err(SJMCLError::from(e)),
-      },
-      Err(e) => return Err(SJMCLError::from(e)),
-    };
+    let mut contents = Vec::new();
+    jar.by_name("mcmod.info")?.read_to_end(&mut contents)?;
+    let mut meta = parse_legacy_forge_mod_metadata_bytes(&contents)?;
     if meta.is_empty() {
       return Err(SJMCLError("len of LegacyForgeModMetadata is 0".to_string()));
     }
-    Ok(meta.remove(0))
+    Ok(meta.swap_remove(0))
   }
 
   async fn get_mod_metadata_from_dir(dir_path: &Path) -> SJMCLResult<Self::Metadata> {
     let legacy_forge_file_path = dir_path.join("mcmod.info");
-    let mut meta: Vec<LegacyForgeModMetadata> =
-      match tokio::fs::read_to_string(legacy_forge_file_path).await {
-        Ok(val) => match serde_json::from_str(val.as_str()) {
-          Ok(val) => val,
-          Err(e) => return Err(SJMCLError::from(e)),
-        },
-        Err(e) => return Err(SJMCLError::from(e)),
-      };
+    let contents = tokio::fs::read(legacy_forge_file_path).await?;
+    let mut meta = parse_legacy_forge_mod_metadata_bytes(&contents)?;
     if meta.is_empty() {
       return Err(SJMCLError("len of LegacyForgeModMetadata is 0".to_string()));
     }
